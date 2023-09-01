@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: wafsetting
+Parameters:
+  Subnet1:
+    Type: String
+    Description: Subnet IDs for VPC
+    Default: 'subnet-013e7448'
+  Subnet2:
+    Type: String
+    Description: Subnet IDs for VPC
+    Default: 'subnet-bdc65be6'
+  SecurityGroup:
+    Type: String
+    Default: 'sg-b2c2cece'
+    Description: SecurityGroup
+  VPC:
+    Type: String
+    Default: 'vpc-40c06426'
+    Description: VPCID
+
+Resources:
+  waftestec2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: "ami-097104a26f5e1c26a" # Rocky 8 Official us-east-1
+      InstanceType: t2.small
+      KeyName: dev-key
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          SubnetId: !Ref Subnet1
+          GroupSet: [ !Ref SecurityGroup ]
+      Tags:
+        - Key: "Name"
+          Value: "dev-waftest"
+      UserData:
+        Fn::Base64: |
+            #!/bin/bash
+            # hostname 設定
+            hostnamectl set-hostname waftest
+            echo "preserve_hostname: true" >> /etc/cloud/cloud.cfg
+            sed -i 's/SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
+            # install
+            yum -y install curl vim bash-completion httpd
+            systemctl enable httpd
+            shutdown -r now
+
+  ALBSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+        GroupDescription: "ALB SG"
+        GroupName: !Sub ${AWS::StackName}-alb-sg
+        VpcId: !Ref VPC
+        Tags:
+          - Key: Name
+            Value: !Sub ${AWS::StackName}-alb-sg
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: "application"
+      Scheme: "internet-facing"
+      Name: !Sub ${AWS::StackName}-alb
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-tg
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-tg
+      Port: 80
+      Protocol: HTTP
+      Matcher:
+        HttpCode: '200'
+      VpcId: !Ref VPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref waftestec2
+
+# Ref: https://dev.classmethod.jp/articles/alb-cfn-template-to-study/
+
+
+# ------------------------------------------------------------#
+# S3
+# ------------------------------------------------------------#
+  S3BucketForWaflog:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aws-waf-logs-dev-test-${AWS::AccountId}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+# ------------------------------------------------------------#
+# WAF v2
+# ------------------------------------------------------------#
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub dev-test-web-acl
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        SampledRequestsEnabled: true
+        MetricName: !Sub dev-test-web-acl
+      Rules:
+        -
+          Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 1
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: NoUserAgent_HEADER
+                - Name: UserAgent_BadBots_HEADER
+                - Name: SizeRestrictions_QUERYSTRING
+                - Name: SizeRestrictions_Cookie_HEADER
+                - Name: SizeRestrictions_BODY
+                - Name: SizeRestrictions_URIPATH
+                - Name: EC2MetaDataSSRF_BODY
+                - Name: EC2MetaDataSSRF_COOKIE
+                - Name: EC2MetaDataSSRF_URIPATH
+                - Name: EC2MetaDataSSRF_QUERYARGUMENTS
+                - Name: GenericLFI_QUERYARGUMENTS
+                - Name: GenericLFI_URIPATH
+                - Name: GenericLFI_BODY
+                - Name: RestrictedExtensions_URIPATH
+                - Name: RestrictedExtensions_QUERYARGUMENTS
+                - Name: GenericRFI_QUERYARGUMENTS
+                - Name: GenericRFI_BODY
+                - Name: GenericRFI_URIPATH
+                - Name: CrossSiteScripting_COOKIE
+                - Name: CrossSiteScripting_QUERYARGUMENTS
+                - Name: CrossSiteScripting_BODY
+                - Name: CrossSiteScripting_URIPATH
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: AWS-AWSManagedRulesCommonRuleSet
+  WAFLogConfig:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      LogDestinationConfigs:
+        - !GetAtt S3BucketForWaflog.Arn
+      ResourceArn: !GetAtt WebAcl.Arn
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref ALB
+      WebACLArn: !GetAtt WebAcl.Arn
+
+
+Outputs:
+  ALBURL:
+    Description: ALB endpoint URL
+    Value: !Join
+        - ""
+        - - http://
+          - !GetAtt ALB.DNSName
+
+# Ref: https://dev.classmethod.jp/articles/cfn-create-waf-log-2021/
